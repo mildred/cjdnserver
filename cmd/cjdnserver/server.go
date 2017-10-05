@@ -34,7 +34,7 @@ func main() {
 	var sockPath string
 	var perms string
 	var cjdroute string
-	flag.StringVar(&sockPath, "sock", "cjdserver.sock", "Socket file path")
+	flag.StringVar(&sockPath, "sock", "/run/cjdnserver/cjdserver.sock", "Socket file path")
 	flag.StringVar(&perms, "perms", "0755", "Socket permissions")
 	flag.StringVar(&cjdroute, "cjdroute", "cjdroute", "cjdroute executable")
 	flag.StringVar(&peer.Address, "peer-address", "", "Peer address to connect to over UDP")
@@ -56,18 +56,20 @@ func main() {
 
 func run(ctx context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, perms os.FileMode, peer *Peer) error {
 	var l net.Listener
-	f, err := os.OpenFile(sockPath, 0, 0)
+	err := os.MkdirAll(path.Dir(sockPath), 0755)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("Remove %s", sockPath)
-			err = os.Remove(sockPath)
-		}
-		log.Printf("Listen on %s", sockPath)
-		l, err = net.Listen("unix", sockPath)
-	} else {
-		l, err = net.FileListener(f)
-		f.Close()
+		return err
 	}
+	_, err = os.Stat(sockPath)
+	if err == nil {
+		log.Printf("Remove %s", sockPath)
+		err = os.Remove(sockPath)
+		if err != nil {
+			return err
+		}
+	}
+	log.Printf("Listen on %s", sockPath)
+	l, err = net.Listen("unix", sockPath)
 	if err != nil {
 		return err
 	}

@@ -20,7 +20,7 @@ func main() {
 	var sockPath string
 	var watchdog bool
 	var privkey string
-	flag.StringVar(&sockPath, "sock", "cjdserver.sock", "Socker file path")
+	flag.StringVar(&sockPath, "sock", "/run/cjdnserver/cjdserver.sock", "Socker file path")
 	flag.BoolVar(&watchdog, "watchdog", false, "internal use")
 	flag.StringVar(&privkey, "privkey", "", "private key")
 	flag.Parse()
