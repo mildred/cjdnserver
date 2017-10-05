@@ -25,6 +25,11 @@ Run `cjdnsclient` with a given socket file (probably something like
 `/run/cjdnserver/cjdnserver.sock`) in the docker container. When the program
 returns, you should have a configured interface.
 
+You might want to specify the following options:
+
+- the socket path
+- the cjdns private key
+
 Server-side
 -----------
 
@@ -41,8 +46,6 @@ Hacking
 TODO
 ----
 
-- ability to send private key from the client to keep the same ip across
-  restarts
 - automatically add UDP peers on master cjdroute
 - use admin interface to stop cjdroute instead of SIGTERM which takes longer
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/fc00/go-cjdns/key"
 	"github.com/jbenet/go-reuseport"
 	"github.com/mildred/cjdnserver"
 	"github.com/mildred/simpleipc"
@@ -105,13 +106,6 @@ func run(ctx context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, per
 func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, cjdroute string, peer *Peer) error {
 	ctx, cancel := context.WithCancel(ctx0)
 
-	tmpdir, err := ioutil.TempDir("", "cjdnserver-client")
-	if err != nil {
-		return err
-	}
-	log.Printf("Receive client in %v", tmpdir)
-	defer os.RemoveAll(tmpdir)
-
 	adminif, err := reuseport.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -120,8 +114,38 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 	log.Printf("Listen to admin %v", adminaddr)
 	defer adminif.Close()
 
+	h := new(simpleipc.Header)
+	privkey, err := h.ReadWithPayload(cnx, nil)
+	if err != nil {
+		return err
+	}
+	var skey *key.Private
+	if len(privkey) > 0 {
+		skey = new(key.Private)
+		if len(privkey) == len(*skey) {
+			copy(skey[:], privkey)
+		} else {
+			skey = nil
+		}
+	}
+	log.Printf("Received header %#v", h)
+	if len(h.Files) == 0 {
+		return fmt.Errorf("Did not received any file descriptor")
+	}
+
+	suffix := ""
+	if skey != nil {
+		suffix = "-" + skey.Pubkey().IP().String()
+	}
+	tmpdir, err := ioutil.TempDir("", "cjdnserver-client"+suffix)
+	if err != nil {
+		return err
+	}
+	log.Printf("Receive client in %v", tmpdir)
+	defer os.RemoveAll(tmpdir)
+
 	sockpath := path.Join(tmpdir, "cjdnstun.socket")
-	conf, ipv6, err := Genconf(cjdroute, sockpath, adminaddr, peer)
+	conf, ipv6, err := Genconf(cjdroute, sockpath, adminaddr, peer, skey)
 	if err != nil {
 		return err
 	}
@@ -135,20 +159,11 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 	log.Printf("Configuration file written to %s", conffile)
 	log.Print(conf)
 
-	h := new(simpleipc.Header)
-	err = h.Read(cnx, nil)
-	if err != nil {
-		return err
-	}
-	log.Printf("Received header %#v", h)
-	if len(h.Files) == 0 {
-		return fmt.Errorf("Did not received any file descriptor")
-	}
 	tunfd, err := MakeTunInNs(h.Files[0], ipv6, InterfaceMTU)
-	_ = tunfd
 	if err != nil {
 		return err
 	}
+	defer tunfd.Close()
 
 	go (func() {
 		err := SendTunDev(sockpath, tunfd)
@@ -193,13 +208,14 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 		case <-ctx.Done():
 			log.Printf("Send SIGTERM to cjdroute")
 			process.Signal(syscall.SIGTERM)
-			break
 		case err := <-cerr:
 			log.Printf("Error: %s", err)
 		case state := <-cstate:
 			log.Printf("Terminated: %s", state.String())
 		}
 	}
+
+	log.Printf("Stopped %s", ipv6)
 
 	return nil
 }
@@ -212,7 +228,7 @@ func receiveWatchdog(ctx0 context.Context, wg *sync.WaitGroup, cancel context.Ca
 		//defer wg.Done()
 		for ctx.Err() == nil {
 			h := new(simpleipc.Header)
-			err := h.Read(cnx, nil)
+			_, err := h.ReadWithPayload(cnx, nil)
 			if err != nil {
 				log.Printf("Received error: %s", err)
 				log.Printf("Watchdog triggered stop")
@@ -248,6 +264,7 @@ func SendTunDev(sockPath string, tunfd *os.File) error {
 			attempts++
 			continue
 		}
+		defer cnx0.Close()
 		cnx := cnx0.(*net.UnixConn)
 
 		h := simpleipc.NewHeader(0, 0, []*os.File{tunfd})

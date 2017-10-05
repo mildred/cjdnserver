@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
+	"github.com/fc00/go-cjdns/key"
 	"github.com/mildred/cjdnserver"
 	"github.com/mildred/simpleipc"
 	"log"
@@ -17,8 +19,10 @@ import (
 func main() {
 	var sockPath string
 	var watchdog bool
+	var privkey string
 	flag.StringVar(&sockPath, "sock", "cjdserver.sock", "Socker file path")
 	flag.BoolVar(&watchdog, "watchdog", false, "internal use")
+	flag.StringVar(&privkey, "privkey", "", "private key")
 	flag.Parse()
 
 	var wg sync.WaitGroup
@@ -36,14 +40,26 @@ func main() {
 			log.Fatal(err)
 		}
 	} else {
-		err := run(ctx, &wg, sockPath)
+		err := run(ctx, &wg, sockPath, privkey)
 		if err != nil {
 			log.Fatal(err)
 		}
 	}
 }
 
-func run(ctx context.Context, wg *sync.WaitGroup, sockPath string) error {
+func run(ctx context.Context, wg *sync.WaitGroup, sockPath, privkey string) error {
+	var err error
+	var skey *key.Private = nil
+
+	if privkey != "" {
+		skey, err = key.DecodePrivate(privkey)
+		if err != nil {
+			return err
+		} else if !skey.Valid() {
+			return fmt.Errorf("invalid private key")
+		}
+	}
+
 	cnx0, err := net.Dial("unix", sockPath)
 	if err != nil {
 		return err
@@ -58,7 +74,14 @@ func run(ctx context.Context, wg *sync.WaitGroup, sockPath string) error {
 
 	log.Printf("Connected to server %v", cnx)
 	h := simpleipc.NewHeader(cjdnserver.InitialRequest, 0, []*os.File{netns})
-	err = h.Write(cnx)
+	if skey != nil {
+		h.Size = uint32(len(*skey))
+	}
+	if skey != nil {
+		err = h.WriteWithPayload(cnx, skey[:])
+	} else {
+		err = h.WriteWithPayload(cnx, nil)
+	}
 	if err != nil {
 		return err
 	}

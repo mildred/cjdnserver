@@ -3,12 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/fc00/go-cjdns/key"
 	"log"
 	"os"
 	"os/exec"
 )
 
-func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer) (string, string, error) {
+func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer, skey *key.Private) (string, string, error) {
 	cmd := exec.Command("sh", "-xc", cjdroute+" --genconf | "+cjdroute+" --cleanconf")
 
 	out, err := cmd.Output()
@@ -21,6 +22,12 @@ func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer) (string, strin
 	err = json.Unmarshal(out, &config)
 	if err != nil {
 		return "", "", err
+	}
+
+	if skey != nil {
+		config["privateKey"] = skey.String()
+		config["publicKey"] = skey.Pubkey().String()
+		config["ipv6"] = skey.Pubkey().IP().String()
 	}
 
 	interfaces_udp_0 := config["interfaces"].(map[string]interface{})["UDPInterface"].([]interface{})[0].(map[string]interface{})
