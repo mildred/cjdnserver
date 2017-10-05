@@ -8,19 +8,19 @@ import (
 	"os/exec"
 )
 
-func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer) (string, error) {
+func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer) (string, string, error) {
 	cmd := exec.Command("sh", "-xc", cjdroute+" --genconf | "+cjdroute+" --cleanconf")
 
 	out, err := cmd.Output()
 	if err != nil {
 		log.Print(string(err.(*exec.ExitError).Stderr))
-		return "", err
+		return "", "", err
 	}
 
 	var config map[string]interface{} = map[string]interface{}{}
 	err = json.Unmarshal(out, &config)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	interfaces_udp_0 := config["interfaces"].(map[string]interface{})["UDPInterface"].([]interface{})[0].(map[string]interface{})
@@ -40,9 +40,10 @@ func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer) (string, error
 	router_interface := config["router"].(map[string]interface{})["interface"].(map[string]interface{})
 	router_interface["tunfd"] = "normal"
 	router_interface["tunDevice"] = tunsockpath
+	ipv6 := config["ipv6"].(string)
 
 	data, err := json.MarshalIndent(config, "", " ")
-	return string(data), err
+	return string(data), ipv6, err
 }
 
 func Start(cjdroute, config string) error {

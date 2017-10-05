@@ -14,6 +14,10 @@ import (
 	"time"
 )
 
+const (
+	InterfaceMTU = 1304
+)
+
 type Peer struct {
 	Address  string
 	Password string
@@ -93,6 +97,29 @@ func handleClient(cnx *net.UnixConn, cjdroute string, peer *Peer) error {
 	log.Printf("Receive client in %v", tmpdir)
 	defer os.RemoveAll(tmpdir)
 
+	adminif, err := reuseport.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	adminaddr := adminif.LocalAddr().String()
+	log.Printf("Listen to admin %v", adminaddr)
+	defer adminif.Close()
+
+	sockpath := path.Join(tmpdir, "cjdnstun.socket")
+	conf, ipv6, err := Genconf(cjdroute, sockpath, adminaddr, peer)
+	if err != nil {
+		return err
+	}
+
+	conffile := path.Join(tmpdir, "cjdroute.conf")
+	err = ioutil.WriteFile(conffile, []byte(conf), 0644)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Configuration file written to %s", conffile)
+	log.Print(conf)
+
 	err = h.Read(cnx, nil)
 	if err != nil {
 		return err
@@ -101,26 +128,11 @@ func handleClient(cnx *net.UnixConn, cjdroute string, peer *Peer) error {
 	if len(h.Files) == 0 {
 		return fmt.Errorf("Did not received any file descriptor")
 	}
-	tunfd, err := MakeTunInNs(h.Files[0])
+	tunfd, err := MakeTunInNs(h.Files[0], ipv6, InterfaceMTU)
 	_ = tunfd
 	if err != nil {
 		return err
 	}
-
-	adminif, err := reuseport.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	adminaddr := adminif.LocalAddr().String()
-	log.Printf("Listen to admin %v", adminaddr)
-
-	sockpath := path.Join(tmpdir, "cjdnstun.socket")
-	conf, err := Genconf(cjdroute, sockpath, adminaddr, peer)
-	if err != nil {
-		return err
-	}
-
-	log.Print(conf)
 
 	go (func() {
 		err := SendTunDev(sockpath, tunfd)
