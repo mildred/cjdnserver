@@ -1,26 +1,49 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"github.com/mildred/cjdnserver"
 	"github.com/mildred/simpleipc"
 	"log"
 	"net"
 	"os"
+	"os/exec"
+	"sync"
+	"syscall"
+	"time"
 )
 
 func main() {
 	var sockPath string
+	var watchdog bool
 	flag.StringVar(&sockPath, "sock", "cjdserver.sock", "Socker file path")
+	flag.BoolVar(&watchdog, "watchdog", false, "internal use")
 	flag.Parse()
 
-	err := run(sockPath)
-	if err != nil {
-		log.Fatal(err)
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	cjdnserver.CancelSignals(cancel, &wg, syscall.SIGINT, syscall.SIGTERM)
+
+	if watchdog {
+		f := os.NewFile(3, "socket")
+		c, err := net.FileConn(f)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = runWatchdog(ctx, &wg, c.(*net.UnixConn))
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		err := run(ctx, &wg, sockPath)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 
-func run(sockPath string) error {
+func run(ctx context.Context, wg *sync.WaitGroup, sockPath string) error {
 	cnx0, err := net.Dial("unix", sockPath)
 	if err != nil {
 		return err
@@ -40,5 +63,43 @@ func run(sockPath string) error {
 		return err
 	}
 
+	f, err := cnx.File()
+	if err != nil {
+		return err
+	}
+
+	err = h.Read(cnx, nil)
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command(os.Args[0], "-watchdog")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.ExtraFiles = append(cmd.ExtraFiles, f)
+	err = cmd.Start()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func runWatchdog(ctx context.Context, wg *sync.WaitGroup, cnx *net.UnixConn) error {
+	var err error
+
+	log.Printf("Running watchdog")
+	h := simpleipc.NewHeader(cjdnserver.WatchdogPing, 0, []*os.File{})
+	for ctx.Err() == nil {
+		timeout, _ := context.WithTimeout(ctx, 30*time.Second)
+		<-timeout.Done()
+		err = h.Write(cnx)
+		if err != nil {
+			return err
+		}
+	}
+
+	log.Printf("Stopped watchdog")
 	return nil
 }

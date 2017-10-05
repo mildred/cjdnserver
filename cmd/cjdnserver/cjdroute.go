@@ -33,8 +33,8 @@ func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer) (string, strin
 	}
 	interfaces_eth_0 := config["interfaces"].(map[string]interface{})["ETHInterface"].([]interface{})[0].(map[string]interface{})
 	interfaces_eth_0["bind"] = "lo"
-	logging := config["logging"].(map[string]interface{})
-	logging["logTo"] = "stdout"
+	//logging := config["logging"].(map[string]interface{})
+	//logging["logTo"] = "stdout"
 	admin := config["admin"].(map[string]interface{})
 	admin["bind"] = adminaddr
 	router_interface := config["router"].(map[string]interface{})["interface"].(map[string]interface{})
@@ -46,10 +46,11 @@ func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer) (string, strin
 	return string(data), ipv6, err
 }
 
-func Start(cjdroute, config string) error {
+func Start(cjdroute, config string) (*os.Process, error) {
 	cmd := exec.Command(cjdroute, "--nobg")
 	cmd.Stdin = bytes.NewReader([]byte(config))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	err := cmd.Start()
+	return cmd.Process, err
 }

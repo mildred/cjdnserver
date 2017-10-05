@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"github.com/jbenet/go-reuseport"
+	"github.com/mildred/cjdnserver"
 	"github.com/mildred/simpleipc"
 	"io/ioutil"
 	"log"
@@ -11,6 +13,8 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -39,13 +43,17 @@ func main() {
 
 	perms1, _ := strconv.ParseInt(perms, 8, 32)
 
-	err := run(cjdroute, sockPath, os.FileMode(perms1), &peer)
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	cjdnserver.CancelSignals(cancel, &wg, syscall.SIGINT, syscall.SIGTERM)
+
+	err := run(ctx, &wg, cjdroute, sockPath, os.FileMode(perms1), &peer)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(cjdroute, sockPath string, perms os.FileMode, peer *Peer) error {
+func run(ctx context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, perms os.FileMode, peer *Peer) error {
 	var l net.Listener
 	f, err := os.OpenFile(sockPath, 0, 0)
 	if err != nil {
@@ -64,20 +72,27 @@ func run(cjdroute, sockPath string, perms os.FileMode, peer *Peer) error {
 	}
 	defer l.Close()
 
+	go func() {
+		<-ctx.Done()
+		l.Close()
+	}()
+
 	log.Printf("Chmod %s to 0%s", sockPath, strconv.FormatInt(int64(perms), 8))
 	err = os.Chmod(sockPath, perms)
 	if err != nil {
 		log.Print(err)
 	}
 
-	for {
+	for ctx.Err() == nil {
 		cnx, err := l.Accept()
 		if err != nil {
 			log.Printf("accept error: %v", err)
 			continue
 		}
+		wg.Add(1)
 		go (func() {
-			err := handleClient(cnx.(*net.UnixConn), cjdroute, peer)
+			defer wg.Done()
+			err := handleClient(ctx, wg, cnx.(*net.UnixConn), cjdroute, peer)
 			if err != nil {
 				log.Print(err)
 			}
@@ -87,8 +102,8 @@ func run(cjdroute, sockPath string, perms os.FileMode, peer *Peer) error {
 	return nil
 }
 
-func handleClient(cnx *net.UnixConn, cjdroute string, peer *Peer) error {
-	var h simpleipc.Header
+func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, cjdroute string, peer *Peer) error {
+	ctx, cancel := context.WithCancel(ctx0)
 
 	tmpdir, err := ioutil.TempDir("", "cjdnserver-client")
 	if err != nil {
@@ -120,6 +135,7 @@ func handleClient(cnx *net.UnixConn, cjdroute string, peer *Peer) error {
 	log.Printf("Configuration file written to %s", conffile)
 	log.Print(conf)
 
+	h := new(simpleipc.Header)
 	err = h.Read(cnx, nil)
 	if err != nil {
 		return err
@@ -141,13 +157,84 @@ func handleClient(cnx *net.UnixConn, cjdroute string, peer *Peer) error {
 		}
 	})()
 
-	log.Printf("Start cjdroute")
-	err = Start(cjdroute, conf)
+	h = simpleipc.NewHeader(cjdnserver.InitialResponse, 0, nil)
+	err = h.Write(cnx)
 	if err != nil {
 		return err
 	}
 
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		receiveWatchdog(ctx, wg, cancel, cnx)
+	}()
+
+	for ctx.Err() == nil {
+		log.Printf("Start cjdroute")
+		process, err := Start(cjdroute, conf)
+		if err != nil {
+			return err
+		}
+
+		cstate := make(chan *os.ProcessState)
+		cerr := make(chan error)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			state, err := process.Wait()
+			if err != nil {
+				cerr <- err
+			} else {
+				cstate <- state
+			}
+		}()
+
+		select {
+		case <-ctx.Done():
+			log.Printf("Send SIGTERM to cjdroute")
+			process.Signal(syscall.SIGTERM)
+			break
+		case err := <-cerr:
+			log.Printf("Error: %s", err)
+		case state := <-cstate:
+			log.Printf("Terminated: %s", state.String())
+		}
+	}
+
 	return nil
+}
+
+func receiveWatchdog(ctx0 context.Context, wg *sync.WaitGroup, cancel context.CancelFunc, cnx *net.UnixConn) {
+	ctx, cancel2 := context.WithCancel(ctx0)
+	ping := make(chan struct{})
+	//wg.Add(1)
+	go func() {
+		//defer wg.Done()
+		for ctx.Err() == nil {
+			h := new(simpleipc.Header)
+			err := h.Read(cnx, nil)
+			if err != nil {
+				log.Printf("Received error: %s", err)
+				log.Printf("Watchdog triggered stop")
+				cancel()
+				cancel2()
+			} else if h.Seq == cjdnserver.WatchdogPing {
+				ping <- struct{}{}
+			} else {
+				log.Printf("Received unknown message from client %d instead of ping", h.Seq)
+			}
+		}
+	}()
+	for ctx.Err() == nil {
+		timeout, _ := context.WithTimeout(ctx, time.Minute)
+		select {
+		case <-timeout.Done():
+			log.Printf("Watchdog triggered stop")
+			cancel()
+			cancel2()
+		case <-ping:
+		}
+	}
 }
 
 func SendTunDev(sockPath string, tunfd *os.File) error {

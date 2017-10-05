@@ -22,7 +22,8 @@ Client-side
 -----------
 
 Run `cjdnsclient` with a given socket file (probably something like
-`/run/cjdnserver/cjdnserver.sock`) in the docker container
+`/run/cjdnserver/cjdnserver.sock`) in the docker container. When the program
+returns, you should have a configured interface.
 
 Server-side
 -----------
@@ -32,7 +33,7 @@ Run `cjdnserver`. You may want to configure using command line flags:
 - the socket path
 - the socket permissions (it cannot reuse an existing socket for now)
 - the path to cjdroute if not in $PATH
-- the DUP address, publickey and password of an upstream peer to connect to
+- the UDP address, publickey and password of an upstream peer to connect to
 
 Hacking
 =======
@@ -40,17 +41,18 @@ Hacking
 TODO
 ----
 
-- restart cjdroute on crash
-- detect container shutdown and stop cjdroute
+- ability to send private key from the client to keep the same ip across
+  restarts
+- automatically add UDP peers on master cjdroute
+- use admin interface to stop cjdroute instead of SIGTERM which takes longer
 
 Client operation
 ----------------
 
 - Open `/proc/self/ns/net`
 - pass the namespace to the server
-- TODO: wait for the server to tell us the tun interface is configured
-- TODO: call subprocess or exec to it, keep the connection open either in the main
-  process or a subprocess
+- wait for the server to tell us the tun interface is configured
+- send watchdog in background
 
 Server Operation
 ----------------
@@ -69,5 +71,5 @@ Server Operation
 - When receiving the tun file descriptor from the helper process, create a pipe
   to pass the tun file descriptor to cjdns
 - Start cjdns
-- TODO: Watch that cjdns keeps running and restart it if necessary
-- TODO: Wait for the connection to close then kill cjdns
+- Watch that cjdns keeps running and restart it if necessary
+- Wait for the connection to close then kill cjdns
