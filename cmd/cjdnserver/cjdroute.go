@@ -38,8 +38,8 @@ func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer, skey *key.Priv
 			"publicKey": peer.Pubkey,
 		}
 	}
-	logging := config["logging"].(map[string]interface{})
-	logging["logTo"] = "stdout"
+	//logging := config["logging"].(map[string]interface{})
+	//logging["logTo"] = "stdout"
 	admin := config["admin"].(map[string]interface{})
 	admin["bind"] = adminaddr
 	adminpass := admin["password"].(string)

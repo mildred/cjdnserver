@@ -186,6 +186,7 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 	}()
 
 	for ctx.Err() == nil {
+		instanceCtx, instanceStop := context.WithCancel(ctx)
 		log.Printf("Start cjdroute")
 		process, err := Start(cjdroute, conf)
 		if err != nil {
@@ -193,10 +194,12 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 		}
 
 		go (func() {
-			err := SendTunDev(sockpath, tunfd)
+			cnx, err := SendTunDev(sockpath, tunfd)
 			if err != nil {
 				log.Print(err)
 			}
+			defer cnx.Close()
+			<-instanceCtx.Done()
 		})()
 
 		h = simpleipc.NewHeader(cjdnserver.InitialResponse, 0, nil)
@@ -236,6 +239,7 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 		case state := <-cstate:
 			log.Printf("Terminated: %s", state.String())
 		}
+		instanceStop()
 	}
 
 	log.Printf("Stopped %s", ipv6)
@@ -276,7 +280,7 @@ func receiveWatchdog(ctx0 context.Context, wg *sync.WaitGroup, cancel context.Ca
 	}
 }
 
-func SendTunDev(sockPath string, tunfd *os.File) error {
+func SendTunDev(sockPath string, tunfd *os.File) (net.Conn, error) {
 	attempts := 0
 	var err error
 	for attempts < 1000 {
@@ -287,15 +291,14 @@ func SendTunDev(sockPath string, tunfd *os.File) error {
 			attempts++
 			continue
 		}
-		defer cnx0.Close()
 		cnx := cnx0.(*net.UnixConn)
 
 		h := simpleipc.NewHeader(0, 0, []*os.File{tunfd})
 		err = h.Write(cnx)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		return nil
+		return cnx0, nil
 	}
-	return err
+	return nil, err
 }
