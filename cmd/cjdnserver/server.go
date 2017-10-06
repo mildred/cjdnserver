@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/fc00/go-cjdns/admin"
 	"github.com/fc00/go-cjdns/key"
 	"github.com/jbenet/go-reuseport"
 	"github.com/mildred/cjdnserver"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -105,6 +107,12 @@ func run(ctx context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, per
 	return nil
 }
 
+func parseAdminAddr(addr string) (string, int) {
+	i := strings.Index(addr, ":")
+	port, _ := strconv.ParseInt(addr[i+1:], 10, 32)
+	return addr[:i], int(port)
+}
+
 func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, cjdroute string, peer *Peer) error {
 	ctx, cancel := context.WithCancel(ctx0)
 
@@ -114,6 +122,8 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 	}
 	adminaddr := adminif.LocalAddr().String()
 	log.Printf("Listen to admin %v", adminaddr)
+	var adminConf admin.CjdnsAdminConfig
+	adminConf.Addr, adminConf.Port = parseAdminAddr(adminaddr)
 	defer adminif.Close()
 
 	h := new(simpleipc.Header)
@@ -147,7 +157,8 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 	defer os.RemoveAll(tmpdir)
 
 	sockpath := path.Join(tmpdir, "cjdnstun.socket")
-	conf, ipv6, err := Genconf(cjdroute, sockpath, adminaddr, peer, skey)
+	conf, ipv6, adminpass, err := Genconf(cjdroute, sockpath, adminaddr, peer, skey)
+	adminConf.Password = adminpass
 	if err != nil {
 		return err
 	}
@@ -158,6 +169,7 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 		return err
 	}
 
+	log.Printf("Admin interface ip %s port %d password %#v", adminConf.Addr, adminConf.Port, adminConf.Password)
 	log.Printf("Configuration file written to %s", conffile)
 	log.Print(conf)
 
@@ -166,19 +178,6 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 		return err
 	}
 	defer tunfd.Close()
-
-	go (func() {
-		err := SendTunDev(sockpath, tunfd)
-		if err != nil {
-			log.Print(err)
-		}
-	})()
-
-	h = simpleipc.NewHeader(cjdnserver.InitialResponse, 0, nil)
-	err = h.Write(cnx)
-	if err != nil {
-		return err
-	}
 
 	wg.Add(1)
 	go func() {
@@ -189,6 +188,19 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 	for ctx.Err() == nil {
 		log.Printf("Start cjdroute")
 		process, err := Start(cjdroute, conf)
+		if err != nil {
+			return err
+		}
+
+		go (func() {
+			err := SendTunDev(sockpath, tunfd)
+			if err != nil {
+				log.Print(err)
+			}
+		})()
+
+		h = simpleipc.NewHeader(cjdnserver.InitialResponse, 0, nil)
+		err = h.Write(cnx)
 		if err != nil {
 			return err
 		}
@@ -208,6 +220,15 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 
 		select {
 		case <-ctx.Done():
+			log.Printf("Send Core_exit()")
+			adm, err := admin.Connect(&adminConf)
+			if err != nil {
+				return fmt.Errorf("connect to admin interface: %v", err)
+			}
+			err = adm.Core_exit()
+			if err != nil {
+				log.Printf("Core_exit: %v", err)
+			}
 			log.Printf("Send SIGTERM to cjdroute")
 			process.Signal(syscall.SIGTERM)
 		case err := <-cerr:

@@ -9,19 +9,19 @@ import (
 	"os/exec"
 )
 
-func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer, skey *key.Private) (string, string, error) {
-	cmd := exec.Command("sh", "-xc", cjdroute+" --genconf | "+cjdroute+" --cleanconf")
+func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer, skey *key.Private) (string, string, string, error) {
+	cmd := exec.Command("sh", "-xc", cjdroute+" --genconf --no-eth | "+cjdroute+" --cleanconf")
 
 	out, err := cmd.Output()
 	if err != nil {
 		log.Print(string(err.(*exec.ExitError).Stderr))
-		return "", "", err
+		return "", "", "", err
 	}
 
 	var config map[string]interface{} = map[string]interface{}{}
 	err = json.Unmarshal(out, &config)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	if skey != nil {
@@ -38,19 +38,18 @@ func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer, skey *key.Priv
 			"publicKey": peer.Pubkey,
 		}
 	}
-	interfaces_eth_0 := config["interfaces"].(map[string]interface{})["ETHInterface"].([]interface{})[0].(map[string]interface{})
-	interfaces_eth_0["bind"] = "lo"
-	//logging := config["logging"].(map[string]interface{})
-	//logging["logTo"] = "stdout"
+	logging := config["logging"].(map[string]interface{})
+	logging["logTo"] = "stdout"
 	admin := config["admin"].(map[string]interface{})
 	admin["bind"] = adminaddr
+	adminpass := admin["password"].(string)
 	router_interface := config["router"].(map[string]interface{})["interface"].(map[string]interface{})
 	router_interface["tunfd"] = "normal"
 	router_interface["tunDevice"] = tunsockpath
 	ipv6 := config["ipv6"].(string)
 
 	data, err := json.MarshalIndent(config, "", " ")
-	return string(data), ipv6, err
+	return string(data), ipv6, adminpass, err
 }
 
 func Start(cjdroute, config string) (*os.Process, error) {
