@@ -2,18 +2,22 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/fc00/go-cjdns/admin"
 	"github.com/fc00/go-cjdns/key"
 	"github.com/jbenet/go-reuseport"
 	"github.com/mildred/cjdnserver"
+	"github.com/mildred/cjdnserver/genpass"
 	"github.com/mildred/simpleipc"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
+	"os/user"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,7 +43,7 @@ func main() {
 	flag.StringVar(&sockPath, "sock", "/run/cjdnserver/cjdserver.sock", "Socket file path")
 	flag.StringVar(&perms, "perms", "0755", "Socket permissions")
 	flag.StringVar(&cjdroute, "cjdroute", "cjdroute", "cjdroute executable")
-	flag.StringVar(&peer.Address, "peer-address", "", "Peer address to connect to over UDP")
+	flag.StringVar(&peer.Address, "peer-address", "0.0.0.0:33097", "Peer address to connect to over UDP")
 	flag.StringVar(&peer.Password, "peer-password", "", "Peer password")
 	flag.StringVar(&peer.Pubkey, "peer-pubkey", "", "Peer public key")
 	flag.Parse()
@@ -57,6 +61,60 @@ func main() {
 }
 
 func run(ctx context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, perms os.FileMode, peer *Peer) error {
+	var adm *admin.Conn
+	if peer.Pubkey == "" || peer.Password == "" {
+		var err error
+		var config *admin.CjdnsAdminConfig = &admin.CjdnsAdminConfig{
+			Addr:     "127.0.0.1",
+			Port:     11234,
+			Password: "NONE",
+		}
+
+		u, err := user.Current()
+		if err != nil {
+			return err
+		}
+
+		rawFile, err := ioutil.ReadFile(u.HomeDir + "/.cjdnsadmin")
+		if err == nil {
+			raw, err := stripComments(rawFile)
+			if err != nil {
+				return err
+			}
+
+			err = json.Unmarshal(raw, &config)
+			if err != nil {
+				return err
+			}
+		}
+
+		adm, err = admin.Connect(config)
+		if err != nil {
+			return err
+		}
+	}
+	if peer.Pubkey == "" {
+		node, err := adm.NodeStore_nodeForAddr("")
+		if err != nil {
+			return err
+		}
+		peer.Pubkey = node.Key
+	}
+	if peer.Password == "" && peer.Pubkey == "" {
+		peer.Password = genpass.Generate(32)
+		err := adm.AuthorizedPasswords_add("cjdnserver peers", peer.Password, 0)
+		if err != nil {
+			return err
+		}
+
+		defer func() {
+			err := adm.AuthorizedPasswords_remove("cjdnserver peers")
+			if err != nil {
+				log.Println(err)
+			}
+		}()
+	}
+
 	var l net.Listener
 	err := os.MkdirAll(path.Dir(sockPath), 0755)
 	if err != nil {
@@ -301,4 +359,13 @@ func SendTunDev(sockPath string, tunfd *os.File) (net.Conn, error) {
 		return cnx0, nil
 	}
 	return nil, err
+}
+
+func stripComments(b []byte) ([]byte, error) {
+	regComment, err := regexp.Compile("(?s)//.*?\n|/\\*.*?\\*/")
+	if err != nil {
+		return nil, err
+	}
+	out := regComment.ReplaceAllLiteral(b, nil)
+	return out, nil
 }
