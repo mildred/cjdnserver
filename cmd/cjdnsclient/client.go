@@ -27,7 +27,8 @@ func main() {
 
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
-	cjdnserver.CancelSignals(cancel, &wg, syscall.SIGINT, syscall.SIGTERM)
+	cjdnserver.CancelSignals(ctx, &wg, cancel, syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
 	if watchdog {
 		f := os.NewFile(3, "socket")

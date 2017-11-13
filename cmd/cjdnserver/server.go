@@ -52,7 +52,8 @@ func main() {
 
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
-	cjdnserver.CancelSignals(cancel, &wg, syscall.SIGINT, syscall.SIGTERM)
+	cjdnserver.CancelSignals(ctx, &wg, cancel, syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
 	err := run(ctx, &wg, cjdroute, sockPath, os.FileMode(perms1), &peer)
 	if err != nil {
