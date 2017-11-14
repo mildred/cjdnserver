@@ -14,7 +14,9 @@ func Genconf(cjdroute, tunsockpath, adminaddr string, peer *Peer, skey *key.Priv
 
 	out, err := cmd.Output()
 	if err != nil {
-		log.Print(string(err.(*exec.ExitError).Stderr))
+		if e, ok := err.(*exec.ExitError); ok {
+			log.Print(string(e.Stderr))
+		}
 		return "", "", "", err
 	}
 

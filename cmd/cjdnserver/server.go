@@ -40,12 +40,14 @@ func main() {
 	var sockPath string
 	var perms string
 	var cjdroute string
+	var detectNetNs bool
 	flag.StringVar(&sockPath, "sock", "/run/cjdnserver/cjdserver.sock", "Socket file path")
 	flag.StringVar(&perms, "perms", "0755", "Socket permissions")
 	flag.StringVar(&cjdroute, "cjdroute", "cjdroute", "cjdroute executable")
 	flag.StringVar(&peer.Address, "peer-address", "0.0.0.0:33097", "Peer address to connect to over UDP")
 	flag.StringVar(&peer.Password, "peer-password", "", "Peer password")
 	flag.StringVar(&peer.Pubkey, "peer-pubkey", "", "Peer public key")
+	flag.BoolVar(&detectNetNs, "detect-netns", false, "Detect network namespace and instanciate cjdns for them")
 	flag.Parse()
 
 	perms1, _ := strconv.ParseInt(perms, 8, 32)
@@ -55,13 +57,15 @@ func main() {
 	cjdnserver.CancelSignals(ctx, &wg, cancel, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	err := run(ctx, &wg, cjdroute, sockPath, os.FileMode(perms1), &peer)
+	err := run(ctx, &wg, cjdroute, sockPath, os.FileMode(perms1), &peer, detectNetNs)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(ctx context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, perms os.FileMode, peer *Peer) error {
+func run(ctx0 context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, perms os.FileMode, peer *Peer, detectNetNs bool) error {
+	ctx, cancel := context.WithCancel(ctx0)
+
 	var adm *admin.Conn
 	if peer.Pubkey == "" || peer.Password == "" {
 		var err error
@@ -147,6 +151,17 @@ func run(ctx context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, per
 		log.Print(err)
 	}
 
+	if detectNetNs {
+		wg.Add(1)
+		go func() {
+			err := detectProcesses(ctx, wg, cjdroute, peer)
+			if err != nil {
+				log.Print(err)
+			}
+			cancel()
+		}()
+	}
+
 	for ctx.Err() == nil {
 		cnx, err := l.Accept()
 		if err != nil {
@@ -156,7 +171,7 @@ func run(ctx context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, per
 		wg.Add(1)
 		go (func() {
 			defer wg.Done()
-			err := handleClient(ctx, wg, cnx.(*net.UnixConn), cjdroute, peer)
+			err := handleClient(ctx, wg, &SimpleIPCClientCnx{cnx.(*net.UnixConn)}, cjdroute, peer)
 			if err != nil {
 				log.Print(err)
 			}
@@ -172,23 +187,15 @@ func parseAdminAddr(addr string) (string, int) {
 	return addr[:i], int(port)
 }
 
-func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, cjdroute string, peer *Peer) error {
-	ctx, cancel := context.WithCancel(ctx0)
+type SimpleIPCClientCnx struct {
+	cnx *net.UnixConn
+}
 
-	adminif, err := reuseport.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	adminaddr := adminif.LocalAddr().String()
-	log.Printf("Listen to admin %v", adminaddr)
-	var adminConf admin.CjdnsAdminConfig
-	adminConf.Addr, adminConf.Port = parseAdminAddr(adminaddr)
-	defer adminif.Close()
-
+func (c *SimpleIPCClientCnx) ReceivePrivKey() (*key.Private, *os.File, error) {
 	h := new(simpleipc.Header)
-	privkey, err := h.ReadWithPayload(cnx, nil)
+	privkey, err := h.ReadWithPayload(c.cnx, nil)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	var skey *key.Private
 	if len(privkey) > 0 {
@@ -201,7 +208,211 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 	}
 	log.Printf("Received header %#v", h)
 	if len(h.Files) == 0 {
-		return fmt.Errorf("Did not received any file descriptor")
+		return nil, nil, fmt.Errorf("Did not received any file descriptor")
+	}
+	return skey, h.Files[0], nil
+}
+
+func (c *SimpleIPCClientCnx) SendInitialResponse() error {
+	h := simpleipc.NewHeader(cjdnserver.InitialResponse, 0, nil)
+	return h.Write(c.cnx)
+}
+
+func (c *SimpleIPCClientCnx) ReceivePing(ctx context.Context) (error, bool) {
+	h := new(simpleipc.Header)
+	_, err := h.ReadWithPayload(c.cnx, nil)
+	if err != nil {
+		return fmt.Errorf("Received error: %s", err), true
+	} else if h.Seq == cjdnserver.WatchdogPing {
+		return nil, false
+	} else {
+		return fmt.Errorf("Received unknown message from client %d instead of ping", h.Seq), false
+	}
+}
+
+type ClientCnx interface {
+	// Return a secret key (or nil, it is optional), a file corresponding to the
+	// network namespace file descriptor and an error
+	ReceivePrivKey() (*key.Private, *os.File, error)
+
+	// Unlock the client side when the cjdns interface is ready
+	SendInitialResponse() error
+
+	// Wait and return when the client sends a watchdog ping. Return an error and
+	// a boolean indicating if the error is fatal or not.
+	ReceivePing(ctx context.Context) (error, bool)
+}
+
+type DetectedNamespace struct {
+	Ino      uint64
+	SKey     *key.Private
+	File     *os.File
+	Cancel   context.CancelFunc
+	Watchdog chan struct{}
+	Mark     bool
+}
+
+func (ns *DetectedNamespace) ReceivePrivKey() (*key.Private, *os.File, error) {
+	return nil, ns.File, nil
+}
+
+func (ns *DetectedNamespace) SendInitialResponse() error {
+	return nil
+}
+
+func (ns *DetectedNamespace) ReceivePing(ctx context.Context) (error, bool) {
+	select {
+	case <-ctx.Done():
+		return nil, false
+	case <-ns.Watchdog:
+		return nil, false
+	}
+}
+
+func mark(list map[uint64]*DetectedNamespace) {
+	for _, ns := range list {
+		ns.Mark = true
+	}
+}
+
+func sweep(list map[uint64]*DetectedNamespace) {
+	for ino, ns := range list {
+		if ns.Mark {
+			ns.Cancel()
+			delete(list, ino)
+		}
+	}
+}
+
+func detectProcesses(ctx context.Context, wg *sync.WaitGroup, cjdroute string, peer *Peer) error {
+	nsList := map[uint64]*DetectedNamespace{}
+
+	for ctx.Err() == nil {
+		mark(nsList)
+		//log.Printf("Detect new network namespaces...")
+
+		selfNsSt, err := os.Stat("/proc/self/ns/net")
+		if err != nil {
+			return err
+		}
+		selfNsInode := selfNsSt.Sys().(*syscall.Stat_t).Ino
+
+		proc, err := os.Open("/proc")
+		if err != nil {
+			return err
+		}
+		defer proc.Close()
+
+		pids, err := proc.Readdirnames(-1)
+		if err != nil {
+			return err
+		}
+		for _, pidName := range pids {
+			//log.Printf("Detect new network namespaces... pid %s", pidName)
+			pid, err := strconv.Atoi(pidName)
+			if err != nil {
+				continue
+			}
+			netnsName := fmt.Sprintf("/proc/%s/ns/net", pidName)
+			se, err := os.Stat(netnsName)
+			if err != nil {
+				//log.Printf("%s: %v", netnsName, err)
+				continue
+			}
+			inode := se.Sys().(*syscall.Stat_t).Ino
+			if inode == selfNsInode {
+				continue
+			}
+			ppid, err := GetPPidOf(pid)
+			if err != nil {
+				log.Printf("/proc/%s/status: %v", pidName, err)
+				continue
+			}
+			if ppid == 0 {
+				continue // the process is our init system
+			}
+			pidnsName := fmt.Sprintf("/proc/%d/ns/pid", pid)
+			ppidnsName := fmt.Sprintf("/proc/%d/ns/pid", ppid)
+			pidnsSt, err := os.Stat(pidnsName)
+			if err != nil {
+				log.Printf("%s: %v", pidnsName, err)
+				continue
+			}
+			ppidnsSt, err := os.Stat(ppidnsName)
+			if err != nil {
+				log.Printf("%s: %v", ppidnsName, err)
+				continue
+			}
+			if pidnsSt.Sys().(*syscall.Stat_t).Ino == ppidnsSt.Sys().(*syscall.Stat_t).Ino {
+				continue // the process is not the init process of a container
+			}
+			nsFile, err := os.Open(netnsName)
+			if err != nil {
+				log.Printf("%s: %v", netnsName, err)
+				continue
+			}
+			skeystr, err := GetEnvironOf(pid, "CJDNS_PRIVKEY")
+			if err != nil {
+				log.Printf("/proc/%d/environ: %v", pid, err)
+				continue
+			}
+			var skey *key.Private
+			if skeystr != "" {
+				skey, err = key.DecodePrivate(skeystr)
+				if err != nil {
+					log.Printf("parse secret key: %v", netnsName, err)
+					continue
+				}
+			}
+			if ns, ok := nsList[inode]; ok {
+				ns.Mark = false
+				ns.Watchdog <- struct{}{}
+			} else {
+				log.Printf("New network namespace for pid %s: %d", pidName, inode)
+				nsCtx, nsCancel := context.WithCancel(ctx)
+				ns := &DetectedNamespace{
+					Ino:      inode,
+					SKey:     skey,
+					File:     nsFile,
+					Cancel:   nsCancel,
+					Watchdog: make(chan struct{}, 0),
+				}
+				nsList[inode] = ns
+				wg.Add(1)
+				go (func() {
+					defer wg.Done()
+					err := handleClient(nsCtx, wg, ns, cjdroute, peer)
+					if err != nil {
+						log.Print(err)
+					}
+				})()
+			}
+		}
+
+		sweep(nsList)
+
+		tmout, _ := context.WithTimeout(ctx, time.Second)
+		<-tmout.Done()
+	}
+	return nil
+}
+
+func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx ClientCnx, cjdroute string, peer *Peer) error {
+	ctx, cancel := context.WithCancel(ctx0)
+
+	adminif, err := reuseport.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	adminaddr := adminif.LocalAddr().String()
+	log.Printf("Listen to admin %v", adminaddr)
+	var adminConf admin.CjdnsAdminConfig
+	adminConf.Addr, adminConf.Port = parseAdminAddr(adminaddr)
+	defer adminif.Close()
+
+	skey, tunfile, err := cnx.ReceivePrivKey()
+	if err != nil {
+		return err
 	}
 
 	suffix := ""
@@ -232,7 +443,7 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 	log.Printf("Configuration file written to %s", conffile)
 	log.Print(conf)
 
-	tunfd, err := MakeTunInNs(h.Files[0], ipv6, InterfaceMTU)
+	tunfd, err := MakeTunInNs(tunfile, ipv6, InterfaceMTU)
 	if err != nil {
 		return err
 	}
@@ -253,16 +464,15 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 		}
 
 		go (func() {
-			cnx, err := SendTunDev(sockpath, tunfd)
+			cnxtun, err := SendTunDev(sockpath, tunfd)
 			if err != nil {
 				log.Print(err)
 			}
-			defer cnx.Close()
+			defer cnxtun.Close()
 			<-instanceCtx.Done()
 		})()
 
-		h = simpleipc.NewHeader(cjdnserver.InitialResponse, 0, nil)
-		err = h.Write(cnx)
+		err = cnx.SendInitialResponse()
 		if err != nil {
 			return err
 		}
@@ -306,24 +516,23 @@ func handleClient(ctx0 context.Context, wg *sync.WaitGroup, cnx *net.UnixConn, c
 	return nil
 }
 
-func receiveWatchdog(ctx0 context.Context, wg *sync.WaitGroup, cancel context.CancelFunc, cnx *net.UnixConn) {
+func receiveWatchdog(ctx0 context.Context, wg *sync.WaitGroup, cancel context.CancelFunc, cnx ClientCnx) {
 	ctx, cancel2 := context.WithCancel(ctx0)
 	ping := make(chan struct{})
 	//wg.Add(1)
 	go func() {
 		//defer wg.Done()
 		for ctx.Err() == nil {
-			h := new(simpleipc.Header)
-			_, err := h.ReadWithPayload(cnx, nil)
+			err, fatal := cnx.ReceivePing(ctx)
 			if err != nil {
-				log.Printf("Received error: %s", err)
-				log.Printf("Watchdog triggered stop")
-				cancel()
-				cancel2()
-			} else if h.Seq == cjdnserver.WatchdogPing {
-				ping <- struct{}{}
+				log.Print(err)
+				if fatal {
+					log.Printf("Watchdog triggered stop")
+					cancel()
+					cancel2()
+				}
 			} else {
-				log.Printf("Received unknown message from client %d instead of ping", h.Seq)
+				ping <- struct{}{}
 			}
 		}
 	}()
