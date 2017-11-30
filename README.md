@@ -58,8 +58,9 @@ Hacking
 TODO
 ----
 
-- automatically add UDP peers on master cjdroute
-- use admin interface to stop cjdroute instead of SIGTERM which takes longer
+- handle when both detecting containers and receiving client connections
+    - return a response to the client that is not an error
+    - client mode: clean up ClientList when client disconnects
 
 Client operation
 ----------------

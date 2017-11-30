@@ -104,8 +104,10 @@ func run(ctx0 context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, pe
 			return err
 		}
 		peer.Pubkey = node.Key
+		log.Printf("Detect peer public key: %s", peer.Pubkey)
 	}
-	if peer.Password == "" && peer.Pubkey == "" {
+	if peer.Password == "" {
+		log.Printf("Register \"cjdnserver peers\" with admin interface")
 		peer.Password = genpass.Generate(32)
 		err := adm.AuthorizedPasswords_add("cjdnserver peers", peer.Password, 0)
 		if err != nil {
@@ -113,6 +115,7 @@ func run(ctx0 context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, pe
 		}
 
 		defer func() {
+			log.Printf("Unregister \"cjdnserver peers\" from admin interface")
 			err := adm.AuthorizedPasswords_remove("cjdnserver peers")
 			if err != nil {
 				log.Println(err)
@@ -151,10 +154,12 @@ func run(ctx0 context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, pe
 		log.Print(err)
 	}
 
+	clientList := NewClientList()
+
 	if detectNetNs {
 		wg.Add(1)
 		go func() {
-			err := detectProcesses(ctx, wg, cjdroute, peer)
+			err := detectProcesses(ctx, wg, clientList, cjdroute, peer)
 			if err != nil {
 				log.Print(err)
 			}
@@ -171,7 +176,7 @@ func run(ctx0 context.Context, wg *sync.WaitGroup, cjdroute, sockPath string, pe
 		wg.Add(1)
 		go (func() {
 			defer wg.Done()
-			err := handleClient(ctx, wg, &SimpleIPCClientCnx{cnx.(*net.UnixConn)}, cjdroute, peer)
+			err := handleClient(ctx, wg, &SimpleIPCClientCnx{cnx.(*net.UnixConn), clientList}, cjdroute, peer)
 			if err != nil {
 				log.Print(err)
 			}
@@ -188,7 +193,8 @@ func parseAdminAddr(addr string) (string, int) {
 }
 
 type SimpleIPCClientCnx struct {
-	cnx *net.UnixConn
+	cnx        *net.UnixConn
+	clientList *ClientList
 }
 
 func (c *SimpleIPCClientCnx) ReceivePrivKey() (*key.Private, *os.File, error) {
@@ -209,6 +215,15 @@ func (c *SimpleIPCClientCnx) ReceivePrivKey() (*key.Private, *os.File, error) {
 	log.Printf("Received header %#v", h)
 	if len(h.Files) == 0 {
 		return nil, nil, fmt.Errorf("Did not received any file descriptor")
+	}
+	st, err := h.Files[0].Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	ns_ino := st.Sys().(*syscall.Stat_t).Ino
+	err = c.clientList.Add(ns_ino, c)
+	if err != nil {
+		return nil, nil, err
 	}
 	return skey, h.Files[0], nil
 }
@@ -275,16 +290,47 @@ func mark(list map[uint64]*DetectedNamespace) {
 	}
 }
 
-func sweep(list map[uint64]*DetectedNamespace) {
+func sweep(clientList *ClientList, list map[uint64]*DetectedNamespace) {
 	for ino, ns := range list {
 		if ns.Mark {
 			ns.Cancel()
 			delete(list, ino)
+			clientList.Remove(ino)
 		}
 	}
 }
 
-func detectProcesses(ctx context.Context, wg *sync.WaitGroup, cjdroute string, peer *Peer) error {
+type ClientList struct {
+	sync.Mutex
+	Ns map[uint64]ClientCnx
+}
+
+var ErrExists error = fmt.Errorf("Namespace already exists")
+
+func NewClientList() *ClientList {
+	return &ClientList{
+		Ns: map[uint64]ClientCnx{},
+	}
+}
+
+func (cl *ClientList) Remove(ns_ino uint64) {
+	cl.Lock()
+	defer cl.Unlock()
+	delete(cl.Ns, ns_ino)
+}
+
+func (cl *ClientList) Add(ns_ino uint64, c ClientCnx) error {
+	cl.Lock()
+	defer cl.Unlock()
+	if _, ok := cl.Ns[ns_ino]; ok {
+		return ErrExists
+	} else {
+		cl.Ns[ns_ino] = c
+		return nil
+	}
+}
+
+func detectProcesses(ctx context.Context, wg *sync.WaitGroup, clientList *ClientList, cjdroute string, peer *Peer) error {
 	nsList := map[uint64]*DetectedNamespace{}
 
 	for ctx.Err() == nil {
@@ -377,19 +423,23 @@ func detectProcesses(ctx context.Context, wg *sync.WaitGroup, cjdroute string, p
 					Cancel:   nsCancel,
 					Watchdog: make(chan struct{}, 0),
 				}
-				nsList[inode] = ns
-				wg.Add(1)
-				go (func() {
-					defer wg.Done()
-					err := handleClient(nsCtx, wg, ns, cjdroute, peer)
-					if err != nil {
-						log.Print(err)
-					}
-				})()
+				if err := clientList.Add(inode, ns); err != nil {
+					log.Print(err)
+				} else {
+					nsList[inode] = ns
+					wg.Add(1)
+					go (func() {
+						defer wg.Done()
+						err := handleClient(nsCtx, wg, ns, cjdroute, peer)
+						if err != nil {
+							log.Print(err)
+						}
+					})()
+				}
 			}
 		}
 
-		sweep(nsList)
+		sweep(clientList, nsList)
 
 		tmout, _ := context.WithTimeout(ctx, time.Second)
 		<-tmout.Done()
